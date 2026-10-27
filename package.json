@@ -1,0 +1,17 @@
+{
+  "name": "techbrief",
+  "version": "1.0.0",
+  "description": "A personal news and technology briefing from attributed publisher feeds.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch scripts/dev.mjs",
+    "build": "bash scripts/build.sh",
+    "validate": "node scripts/validate-artifact.mjs",
+    "test": "node --test tests/news.test.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
