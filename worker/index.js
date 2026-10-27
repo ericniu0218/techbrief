@@ -91,18 +91,12 @@ export default {
     const url = new URL(request.url);
     if (!['GET', 'HEAD'].includes(request.method)) return response('Method not allowed', 'text/plain', 405);
     if (url.pathname === '/api/news') {
-      const cacheKey = new Request(url.origin + '/api/news');
-      const edgeCache = typeof caches !== 'undefined' ? caches.default : null;
-      const hit = await edgeCache?.match(cacheKey);
-      if (hit) return hit;
       if (!cached || !cached.articles.length || Date.now() - Date.parse(cached.fetchedAt) > 300000) {
         if (!inflight) inflight = collectNews(fetch, cached).then(data => { cached = data; return data; }).finally(() => { inflight = null; });
         await inflight;
       }
       const ok = cached.articles.length > 0;
-      const res = new Response(JSON.stringify(cached), { headers: { ...security, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': ok ? 'public, max-age=60, s-maxage=300' : 'no-store' } });
-      if (ok && edgeCache && ctx?.waitUntil) ctx.waitUntil(edgeCache.put(cacheKey, res.clone()));
-      return res;
+      return new Response(JSON.stringify(cached), { headers: { ...security, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': ok ? 'private, max-age=60' : 'no-store' } });
     }
     if (url.pathname === '/') return response(HTML, 'text/html; charset=utf-8');
     if (url.pathname === '/style.css') return response(CSS, 'text/css; charset=utf-8');

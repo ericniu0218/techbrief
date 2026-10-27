@@ -58,7 +58,7 @@ The dependency-free app uses an ES module Worker with `fetch(request, env, ctx)`
 
 ## Refresh and storage
 
-Feeds load on demand with a five-minute memory/edge cache and a 12-second timeout per publisher. Refresh may return the same cached edition. The app removes common tracking parameters and deduplicates identical URLs/headlines; it does not yet group different reports about one event. Feed coverage can be incomplete and older entries retain their original publication dates.
+Feeds load on demand with a five-minute in-memory cache and a 12-second timeout per publisher. Browsers may reuse a response for up to one minute. The app does not use the platform's restricted Cache API. Refresh may return the same cached edition. The app removes common tracking parameters and deduplicates identical URLs/headlines; it does not yet group different reports about one event. Feed coverage can be incomplete and older entries retain their original publication dates.
 
 Local storage is specific to a browser and origin. Localhost and the hosted site have separate reading lists. There is no account sync, durable article archive, background scheduler, or email digest. In-memory fallback may disappear when a server instance restarts. Failed feeds and cached articles are identified in the source panel.
 
