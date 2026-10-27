@@ -63,11 +63,11 @@ test('worker serves a valid client script, app shell and source plan; rejects un
   const request = path => worker.fetch(new Request('http://localhost' + path), {}, {});
   const home = await request('/');
   assert.equal(home.status, 200);
-  assert.match(await home.text(), /Your daily perspective/);
+  assert.match(await home.text(), /Your top 10 stories/);
   const script = await request('/app.js');
   const client = await script.text();
   assert.doesNotThrow(() => new Script(client));
-  assert.match(await (await request('/source-plan')).text(), /STUDENT SUBSCRIPTION/);
+  assert.match(await (await request('/source-plan')).text(), /student subscription/i);
   assert.equal((await request('/missing')).status, 404);
   assert.equal((await worker.fetch(new Request('http://localhost/', { method: 'POST' }))).status, 405);
   assert.ok(home.headers.get('Content-Security-Policy').includes("script-src 'self'"));

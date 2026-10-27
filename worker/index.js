@@ -38,20 +38,21 @@ export function parseFeed(xml, source) {
   if (/<!DOCTYPE|<!ENTITY/i.test(xml)) throw new Error('Unsupported XML declarations');
   if (!/<(?:rss|feed|rdf:RDF)\b/i.test(xml)) throw new Error('Invalid feed response');
   const entries = xml.match(/<item\b[^>]*>[\s\S]*?<\/item>|<entry\b[^>]*>[\s\S]*?<\/entry>/gi) ?? [];
-  const stories = entries.slice(0, 30).map(entry => {
+  const stories = entries.slice(0, 30).map((entry, feedPosition) => {
     const atomLink = [...entry.matchAll(/<link\b([^>]+)>/gi)].find(m => !/rel=["'](?:self|enclosure)["']/i.test(m[1]));
     const url = safeLink(tag(entry, 'link') || atomLink?.[1].match(/href=["']([^"']+)/i)?.[1] || '');
     const title = plainText(tag(entry, 'title')).slice(0, 400);
     const date = new Date(plainText(tag(entry, 'pubDate') || tag(entry, 'published') || tag(entry, 'updated') || tag(entry, 'dc:date')));
     const publishedAt = Number.isFinite(date.getTime()) ? date.toISOString() : null;
     const summary = summarize(tag(entry, 'description') || tag(entry, 'summary') || tag(entry, 'content:encoded'));
+    const sourceText = plainText(tag(entry, 'content:encoded') || tag(entry, 'content') || tag(entry, 'description') || tag(entry, 'summary')).slice(0, 14000);
     const categories = [...entry.matchAll(/<category\b[^>]*>([\s\S]*?)<\/category>/gi)].map(m => plainText(m[1]));
     const content = title + ' ' + summary + ' ' + categories.join(' ');
     const topics = [source.group];
     if (/\b(AI|artificial intelligence|LLM|OpenAI|Anthropic|machine learning|ChatGPT)\b/i.test(content)) topics.push('AI');
     if (/\b(startup|start-up|funding|venture|Series [A-F])\b/i.test(content)) topics.push('Startups');
     if (/\b(science|scientist|space|NASA|climate|astronom|researchers|quantum)\b/i.test(content)) topics.push('Science');
-    return { id: url, url, title, summary, publishedAt, sourceId: source.id, source: source.name, group: source.group, topics, subscription: !!source.subscription };
+    return { id: url, url, title, summary, sourceText, feedPosition, publishedAt, sourceId: source.id, source: source.name, group: source.group, topics, subscription: !!source.subscription };
   }).filter(a => a.url && a.title && (!a.publishedAt || Date.parse(a.publishedAt) < Date.now() + 86400000));
   if (!stories.length) throw new Error('Feed contained no usable articles');
   return stories;
@@ -64,6 +65,179 @@ export function deduplicate(articles) {
     seen.add(a.url); seen.add(title); return true;
   });
 }
+const STOP_WORDS = new Set('about after again also amid among been before being could does first from have here into just latest more most much near news next over says said some than that their them then there these they this those through today under very what when where which while will with would your'.split(' '));
+function titleTokens(text) {
+  const normalized = text.toLowerCase().replace(/\bbuy\s+outs?\b/g, 'buyout').replace(/\bjob cuts?\b/g, 'layoffs').replace(/\binitial public offering\b/g, 'ipo');
+  return new Set((normalized.match(/[\p{L}\p{N}]+/gu) || []).filter(t => t.length > 3 && !STOP_WORDS.has(t)).map(t => t.replace(/(?:ing|ed|s)$/, '')));
+}
+function overlap(a, b) {
+  const common = [...a].filter(t => b.has(t)).length;
+  return common >= 3 ? common / Math.max(1, Math.min(a.size, b.size)) : 0;
+}
+function publisher(id) { return id?.startsWith('bbc-') ? 'bbc' : id; }
+function eventClass(title) {
+  if (/\b(prosecut|indict|criminal|accus|leaks?)/i.test(title)) return 'prosecution';
+  if (/\b(ipo|initial public offering|public debut|share listing|stock market debut)/i.test(title)) return 'ipo';
+  if (/\b(buyouts?|buy out|layoffs?|job cuts?)/i.test(title)) return 'workforce';
+  if (/\b(cyberattack|data breach|outage)/i.test(title)) return 'cyber-incident';
+  return '';
+}
+const GENERIC_EVENT_TERMS = new Set('trump president administration justice department court government official officials agency company announce announc attempt charge accusation prosecut criminal leak workforce employee public market share offer buyout debut listing'.split(' '));
+
+export function rankArticles(articles, { focus = 'balanced', sourceIds = SOURCES.map(s => s.id), now = Date.now() } = {}) {
+  const candidates = deduplicate(articles).filter(a => sourceIds.includes(a.sourceId) && a.publishedAt && now - Date.parse(a.publishedAt) <= 96 * 3600000 && Date.parse(a.publishedAt) <= now + 3600000);
+  const tokens = new Map(candidates.map(a => [a.id, titleTokens(a.title)]));
+  const frequency = new Map();
+  for (const set of tokens.values()) for (const token of set) frequency.set(token, (frequency.get(token) || 0) + 1);
+  const sameEvent = (a, b) => {
+    const at = tokens.get(a.id), bt = tokens.get(b.id);
+    if (overlap(at, bt) >= .33) return true;
+    const kind = eventClass(a.title);
+    return !!kind && kind === eventClass(b.title) && [...at].some(t => bt.has(t) && !GENERIC_EVENT_TERMS.has(t) && frequency.get(t) <= 4);
+  };
+  const scored = candidates.map(article => {
+    const text = article.title + ' ' + article.summary;
+    const ageHours = Math.max(0, (now - Date.parse(article.publishedAt)) / 3600000);
+    const coverage = new Set(candidates.filter(a => a.id !== article.id && publisher(a.sourceId) !== publisher(article.sourceId) && sameEvent(a, article)).map(a => publisher(a.sourceId))).size;
+    let impact = 0;
+    if (/\b(election|presiden|supreme court|ceasefire|invasion|war|nuclear|peace deal|prime minister|constitution|national security)/i.test(text)) impact += 23;
+    if (/\b(interest rates|inflation|recession|central bank|federal reserve|trade war|tariff|global economy|unemployment|food assistance|millions|billion|workforce|layoffs)/i.test(text)) impact += 17;
+    if (/\b(cyberattack|data breach|security flaw|vulnerabilit|outage|pandemic|earthquake|hurricane|wildfire|evacuat|killed|deaths|fatal)/i.test(text)) impact += 20;
+    if (/\b(regulat|antitrust|legislation|lawsuit|ban|court|major|layoffs|workforce|buyouts)/i.test(text)) impact += 12;
+    const technology = article.group === 'Technology';
+    const relevance = focus === 'technology' ? (technology ? 23 : 0) : focus === 'world' ? (technology ? 0 : 23) : (technology ? 7 : 5);
+    const techImpact = technology && /\b(AI|artificial intelligence|OpenAI|Anthropic|semiconductor|chip|operating system|breakthrough|data cent|IPO)/i.test(text) ? 10 : 0;
+    let lowImpact = /\b(deals|discount|coupon|best .* to buy|review:|word of the year|celebrity|horoscope|watch out|secrets for winning)/i.test(article.title) ? 20 : 0;
+    if (/^(how|why|what)\b/i.test(article.title)) lowImpact += 10;
+    if (/\b(new (?:ipad|iphone)|unveils? (?:a |the )?new|memoir|and,|roundup|morning news)/i.test(article.title)) lowImpact += 8;
+    const freshness = 18 * Math.exp(-ageHours / 24);
+    const placement = 8 / (1 + (article.feedPosition || 0) / 3);
+    const score = freshness + placement + Math.min(impact, 42) + relevance + techImpact + Math.min(coverage, 3) * 13 - lowImpact;
+    const reasons = [];
+    if (impact >= 20) reasons.push('Broad public or economic impact');
+    if (coverage) reasons.push('Related coverage from ' + (coverage + 1) + ' independent publishers');
+    if (techImpact) reasons.push('Relevant to major technology developments');
+    if (ageHours <= 12) reasons.push('Recent development');
+    if (!reasons.length) reasons.push('Prominent in the available publisher feeds');
+    return { ...article, score, reasons, coverage: coverage + 1 };
+  });
+  const selected = [], counts = new Map();
+  while (scored.length && selected.length < 10) {
+    // One representative per closely matching event; source variants still inform coverage.
+    for (let i = scored.length - 1; i >= 0; i--) if (selected.some(a => sameEvent(a, scored[i]))) scored.splice(i, 1);
+    if (!scored.length) break;
+    for (const a of scored) {
+      const repetition = selected.reduce((max, b) => Math.max(max, overlap(tokens.get(a.id), tokens.get(b.id))), 0);
+      a.adjustedScore = a.score - (counts.get(publisher(a.sourceId)) || 0) * 8 - (repetition >= .6 ? 36 : 0);
+    }
+    scored.sort((a, b) => b.adjustedScore - a.adjustedScore || (Date.parse(b.publishedAt) - Date.parse(a.publishedAt)) || a.id.localeCompare(b.id));
+    const chosen = scored.shift();
+    selected.push({ ...chosen, rank: selected.length + 1 });
+    counts.set(publisher(chosen.sourceId), (counts.get(publisher(chosen.sourceId)) || 0) + 1);
+  }
+  return selected;
+}
+
+export function extractBullets(article) {
+  const text = plainText(article.sourceText || article.summary || article.title);
+  const protectedText = text.replace(/\b(Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs)\./g, '$1\uE000').replace(/(\d)\.(?=\d)/g, '$1\uE000');
+  const segments = typeof Intl.Segmenter === 'function' ? [...new Intl.Segmenter('en', { granularity: 'sentence' }).segment(protectedText)].map(s => s.segment) : protectedText.match(/[^.!?]+(?:[.!?]+[\u201d\u2019"']*(?=\s|$)|$)/g) || [protectedText];
+  const sentences = segments.map(s => s.replace(/\uE000/g, '.'));
+  const keywords = titleTokens(article.title);
+  const seen = new Set();
+  const choices = sentences.map((sentence, index) => {
+    const value = summarize(sentence.trim(), 310);
+    const key = value.toLowerCase().replace(/\W/g, '');
+    if (value.length < 20 || seen.has(key) || /^\(?(read (the )?(full|more)|subscribe|sign up|advertisement|the post .* appeared first|image credit|hide caption)/i.test(value)) return null;
+    seen.add(key);
+    const matches = [...titleTokens(value)].filter(t => keywords.has(t)).length;
+    if (value.length < 90 && /\b(consequences.*global|time will tell|more than ever|undoubtedly)/i.test(value)) return null;
+    return { value, index, tokens: titleTokens(value), score: (index === 0 ? 12 : 0) + matches + (/\d/.test(value) ? 2 : 0) + (/\b(will|deadline|expects|plans to|however|but|warned|caution|affect|require)/i.test(value) ? 2 : 0) - index * .1 };
+  }).filter(Boolean);
+  const selected = [];
+  while (choices.length && selected.length < 5) {
+    for (const choice of choices) choice.noveltyScore = choice.score - selected.reduce((max, previous) => Math.max(max, overlap(choice.tokens, previous.tokens)), 0) * 12;
+    choices.sort((a, b) => b.noveltyScore - a.noveltyScore);
+    const next = choices.shift();
+    if (!selected.some(previous => overlap(next.tokens, previous.tokens) >= .72)) selected.push(next);
+  }
+  selected.sort((a, b) => a.index - b.index);
+  return selected.length ? selected.map(c => c.value) : [summarize(text || article.title, 310)];
+}
+
+export function extractArticleText(html) {
+  // Prefer the publisher's explicit article body over unrelated page furniture.
+  for (const match of html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const findBody = value => {
+        if (!value || typeof value !== 'object') return '';
+        if (typeof value.articleBody === 'string' && value.isAccessibleForFree !== false && value.isAccessibleForFree !== 'false') return value.articleBody;
+        for (const child of Object.values(value)) {
+          if (typeof child === 'object') { const body = findBody(child); if (body) return body; }
+        }
+        return '';
+      };
+      const body = plainText(findBody(JSON.parse(match[1])));
+      if (body.length >= 400) return body.slice(0, 14000);
+    } catch { /* Some publishers include invalid JSON-LD; try their article markup. */ }
+  }
+  if (/"isAccessibleForFree"\s*:\s*(?:false|"false")/i.test(html)) return '';
+  const section = (html.match(/<article\b[^>]*>([\s\S]*?)<\/article>/i)?.[1] || html.match(/<main\b[^>]*>([\s\S]*?)<\/main>/i)?.[1] || '').replace(/<(figure|aside|nav)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ');
+  const paragraphs = [...section.matchAll(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi)].map(m => {
+    if (/(?:caption|credit|byline|related|recommend|promo)/i.test(m[1])) return '';
+    const p = plainText(m[2]);
+    const linkText = [...m[2].matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi)].map(a => plainText(a[1])).join(' ');
+    if (linkText.length > p.length * .65 || /hide caption|image credit/i.test(p)) return '';
+    return p;
+  }).filter(p => p.length >= 45 && /[.!?][\u201d\u2019"')]*$/.test(p) && !/^(subscribe|sign up|advertisement|copyright|all rights reserved|read more|follow us|listen to|image source|image caption)/i.test(p));
+  const text = paragraphs.join(' ');
+  return text.length >= 400 ? text.slice(0, 14000) : '';
+}
+
+const articleCache = new Map();
+const articleRequests = new Map();
+const ARTICLE_HOSTS = { 'bbc-world': ['bbc.co.uk', 'bbc.com'], 'bbc-tech': ['bbc.co.uk', 'bbc.com'], npr: ['npr.org'], ars: ['arstechnica.com'], tc: ['techcrunch.com'] };
+function allowedArticleURL(url, sourceId) {
+  try { const u = new URL(url); return u.protocol === 'https:' && (ARTICLE_HOSTS[sourceId] || []).some(host => u.hostname === host || u.hostname.endsWith('.' + host)); } catch { return false; }
+}
+export async function readPublicArticle(article, fetcher = fetch) {
+  if (article.subscription || !allowedArticleURL(article.url, article.sourceId)) return article;
+  if ((article.sourceText || '').length >= 1800) return { ...article, summaryBasis: 'Publisher article text in feed' };
+  const existing = articleCache.get(article.url);
+  if (existing && Date.now() - existing.at < 1800000) return { ...article, ...existing.content };
+  if (!articleRequests.has(article.url)) articleRequests.set(article.url, (async () => {
+    try {
+      let url = article.url;
+      for (let redirects = 0; redirects < 3; redirects++) {
+        const res = await fetcher(url, { redirect: 'manual', headers: { Accept: 'text/html', 'User-Agent': 'TechBrief/1.0 personal-news-reader' }, signal: AbortSignal.timeout(7000) });
+        if ([301, 302, 303, 307, 308].includes(res.status)) {
+          const target = new URL(res.headers.get('Location'), url).href;
+          if (!allowedArticleURL(target, article.sourceId)) return null;
+          url = target; continue;
+        }
+        if (!res.ok || !/text\/html/i.test(res.headers.get('Content-Type') || '')) return null;
+        const length = Number(res.headers.get('Content-Length') || 0);
+        if (length > 2500000) return null;
+        const html = await res.text();
+        if (html.length > 2500000) return null;
+        const sourceText = extractArticleText(html);
+        return sourceText ? { sourceText, summaryBasis: 'Public article text' } : null;
+      }
+    } catch { /* Keep the publisher feed text when article access is unavailable. */ }
+    return null;
+  })().finally(() => articleRequests.delete(article.url)));
+  const content = await articleRequests.get(article.url);
+  if (articleCache.size >= 40) articleCache.delete(articleCache.keys().next().value);
+  articleCache.set(article.url, { at: Date.now(), content: content || {} });
+  return content ? { ...article, ...content } : article;
+}
+
+export function makeBriefing(edition, options = {}) {
+  const ranked = rankArticles(edition.articles, options);
+  const articles = ranked.map(({ sourceText, score, adjustedScore, feedPosition, ...article }) => ({ ...article, bullets: extractBullets({ ...article, sourceText }), summaryBasis: article.summaryBasis || 'Publisher feed text' }));
+  return { articles, sources: edition.sources, fetchedAt: edition.fetchedAt, focus: options.focus || 'balanced', rankedAt: new Date(options.now || Date.now()).toISOString(), summaryMode: 'publisher', scannedCount: edition.articles.filter(a => !options.sourceIds || options.sourceIds.includes(a.sourceId)).length, summaryMethod: 'Up to five relevant sentences per story, extracted from accessible article text or publisher feeds. No facts are added beyond that source text.', rankingMethod: 'Heuristic ranking by public impact, independent headline coverage, recency, feed placement and your news/technology focus. Repeated subjects and publishers receive a diversity penalty.' };
+}
+
 let cached = null;
 let inflight = null;
 export async function collectNews(fetcher = fetch, previous = null) {
@@ -95,11 +269,18 @@ export default {
         if (!inflight) inflight = collectNews(fetch, cached).then(data => { cached = data; return data; }).finally(() => { inflight = null; });
         await inflight;
       }
-      const ok = cached.articles.length > 0;
-      return new Response(JSON.stringify(cached), { headers: { ...security, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': ok ? 'private, max-age=60' : 'no-store' } });
+      const focus = ['balanced', 'technology', 'world'].includes(url.searchParams.get('focus')) ? url.searchParams.get('focus') : 'balanced';
+      const sourceIds = url.searchParams.has('sources') ? url.searchParams.get('sources').split(',').filter(id => SOURCES.some(s => s.id === id)) : SOURCES.map(s => s.id);
+      const options = { focus, sourceIds };
+      const chosen = rankArticles(cached.articles, options);
+      const enriched = await Promise.all(chosen.map(article => readPublicArticle(article)));
+      const lookup = new Map(enriched.map(article => [article.id, article]));
+      const briefing = makeBriefing({ ...cached, articles: cached.articles.map(article => lookup.get(article.id) || article) }, options);
+      const ok = briefing.articles.length > 0;
+      return new Response(JSON.stringify(briefing), { headers: { ...security, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': ok ? 'private, max-age=60' : 'no-store' } });
     }
     if (url.pathname === '/') return response(HTML, 'text/html; charset=utf-8');
-    if (url.pathname === '/style.css') return response(CSS, 'text/css; charset=utf-8');
+    if (url.pathname === '/style.css') return response(CSS + BRIEF_CSS, 'text/css; charset=utf-8');
     if (url.pathname === '/app.js') return response(CLIENT, 'application/javascript; charset=utf-8');
     if (url.pathname === '/source-plan') return response(PLAN, 'text/plain; charset=utf-8');
     if (url.pathname === '/health') return response('{"status":"ok"}', 'application/json');
@@ -124,130 +305,77 @@ dialog{border:1px solid #d7e0d4;border-radius:10px;width:min(700px,calc(100vw - 
 @media(prefers-reduced-motion:reduce){*{animation:none!important;scroll-behavior:auto!important}}
 `;
 
+const BRIEF_CSS = String.raw`
+.content{max-width:1450px}.intro{margin-bottom:25px}.intro h1{font-size:49px}.intro p{font-size:14px}.brief-toolbar{display:flex;align-items:center;justify-content:space-between;gap:20px;background:#e9eee4;border:1px solid #d8e1d2;padding:17px 21px;border-radius:7px;margin-bottom:30px}.brief-stats{display:flex;gap:18px;align-items:center;color:#61745f;font-size:11px}.brief-stats b{color:#28483a;font-weight:650}.focus-label{display:flex;align-items:center;gap:10px;color:#627161;font-size:11px}.focus-label select{border:1px solid #c5d2bf;border-radius:4px;background:#f6f8f1;color:#29483a;padding:8px 28px 8px 11px;max-width:190px;font-size:12px}.workspace{grid-template-columns:minmax(0,1fr) 245px;gap:36px}.brief-list{display:grid;gap:20px}.story-card{border:1px solid #dce3d8;background:#fff;border-radius:8px;padding:25px 27px;position:relative}.story-heading{display:grid;grid-template-columns:42px 1fr;gap:12px;align-items:start}.story-rank{font:400 36px/1 var(--serif);color:#93a08e;padding-top:2px}.story-card:first-child{border-top:3px solid #64815b}.story-card:first-child .story-rank{color:#4f7447}.story-kicker{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:10px;color:#81907d;margin-bottom:9px;line-height:1.5}.story-kicker .category{color:#4c7044;text-transform:uppercase;letter-spacing:.8px;font-size:9px;font-weight:650}.story-card h2{font:400 30px/1.13 var(--serif);letter-spacing:-.35px;margin:0;color:#1b3435;overflow-wrap:anywhere}.story-bullets{list-style:none;padding:0;margin:21px 0 18px 54px;display:grid;gap:11px}.story-bullets li{position:relative;font-size:14px;line-height:1.75;color:#4c6054;padding-left:16px;overflow-wrap:anywhere}.story-bullets li:before{content:'';position:absolute;left:0;top:11px;width:4px;height:4px;background:#8ba47c;border-radius:50%}.story-footer{margin-left:54px;padding-top:15px;border-top:1px solid #edf0e9;display:flex;justify-content:space-between;align-items:center;gap:16px;font-size:10px;color:#81907d}.story-footer a{color:#52754c;text-decoration:none}.story-footer a:hover{text-decoration:underline}.story-actions{display:flex;gap:12px;align-items:center}.story-footer .save-button{padding:5px}.story-ranking summary{cursor:pointer;list-style:none;color:#607b56;font-size:10px}.story-ranking summary::-webkit-details-marker{display:none}.story-ranking summary:after{content:' +';color:#9bad93}.story-ranking[open] summary:after{content:' −'}.ranking-explanation{margin:13px 0 0 54px;padding:12px 15px;background:#f2f5ee;border-radius:4px;font-size:11px;line-height:1.8;color:#718269}.rank-reason{display:block}.rank-note{font-size:11px;line-height:1.8;color:#85917e;margin-top:20px}.rail .rail-title{margin-bottom:14px}.criteria{display:grid;gap:16px}.criterion{display:grid;grid-template-columns:22px 1fr;gap:9px}.criterion-number{font:400 18px/1 var(--serif);color:#91a285}.criterion strong{display:block;font-size:11px;font-weight:550;margin-bottom:4px;color:#536c4c}.criterion p{font-size:10px;line-height:1.7;color:#87927f;margin:0}.summary-limit{font-size:9px;color:#9a8a68}.rail .note-card p{font-size:11px}.method-button{border:0;background:none;color:#627b58;text-align:left;padding:0;font-size:10px;text-decoration:underline;text-underline-offset:4px}.brief-finish{text-align:center;padding:26px 10px 6px;color:#75886a;font-size:12px}.brief-finish span{display:block;font:400 29px/1.2 var(--serif);color:#49633f;margin-bottom:7px}.sidebar-bottom .edition{line-height:1.8}.page-loading{opacity:.55;pointer-events:none}.source-dialog-foot{display:flex;justify-content:flex-end;padding-top:20px;border-top:1px solid var(--line);margin-top:8px}.error-action{margin-top:15px}.topbar .status.error .tiny-dot{background:#b78553}
+@media(max-width:1150px){.workspace{grid-template-columns:minmax(0,1fr) 210px;gap:24px}.story-card{padding:22px}.story-card h2{font-size:28px}.story-bullets li{font-size:13px}}
+@media(max-width:900px){.workspace{grid-template-columns:1fr}.story-card{padding:25px}.brief-toolbar{flex-wrap:wrap;gap:15px}.intro h1{font-size:44px}.intro p{font-size:12px}}
+@media(max-width:640px){.intro h1{font-size:40px}.intro p{font-size:12px;line-height:1.8;max-width:280px}.brief-toolbar{padding:15px 17px;gap:15px;margin-bottom:22px}.brief-stats{gap:13px;font-size:10px}.focus-label{width:100%;justify-content:space-between}.focus-label select{font-size:11px;max-width:195px}.story-card{padding:21px 18px}.story-heading{grid-template-columns:27px 1fr;gap:9px}.story-rank{font-size:29px;padding-top:3px}.story-card h2{font-size:27px}.story-kicker{font-size:9px;gap:5px}.story-bullets{margin:19px 0 18px;gap:12px}.story-bullets li{font-size:13px;line-height:1.8;padding-left:14px}.story-footer{margin-left:0;gap:10px}.ranking-explanation{margin:13px 0 0}.story-footer .source-mark{display:none}.story-actions{gap:8px}.rank-note{font-size:10px}.brief-finish span{font-size:26px}.intro>.outline-button{align-self:start;margin-top:30px}.content{padding-top:17px}.topbar{padding-top:0}.brief-list{gap:16px}}
+`;
+
 const CLIENT = String.raw`
 const $=s=>document.querySelector(s);
-const icons={bookmark:'<path d="M6 3h12v18l-6-4-6 4V3Z"/>',refresh:'<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 11.5-2L20 8M4 16l2.5 3A7 7 0 0 0 18 17"/>'};
-const svg=name=>'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+icons[name]+'</svg>';
+const ALL_SOURCES=['bbc-world','npr','nyt','bbc-tech','ars','tc'];
 const escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const safeURL=s=>{try{const u=new URL(s);return u.protocol==='https:'?u.href:'#'}catch{return '#'}};
 function readStore(key,fallback){try{return JSON.parse(localStorage.getItem(key))??fallback}catch{return fallback}}
-let saved=readStore('techbrief-saved',[]);if(!Array.isArray(saved))saved=[];saved=saved.filter(a=>a&&typeof a.title==='string'&&typeof a.url==='string'&&Array.isArray(a.topics)&&typeof a.sourceId==='string').slice(0,500);
+let saved=readStore('techbrief-saved',[]);if(!Array.isArray(saved))saved=[];saved=saved.filter(a=>a&&typeof a.title==='string'&&typeof a.url==='string'&&typeof a.sourceId==='string').slice(0,100);
 let disabled=readStore('techbrief-disabled',[]);if(!Array.isArray(disabled))disabled=[];
-const state={articles:[],sources:[],view:'briefing',topic:'All stories',query:'',sort:'balanced',limit:12,loading:true,error:null};
-let activeArticle=null,toastTimer;
-function persist(key,value){try{localStorage.setItem(key,JSON.stringify(value));return true}catch{toast('Browser storage is unavailable. Changes will last for this visit.');return false}}
+let focus=readStore('techbrief-focus','balanced');if(!['balanced','technology','world'].includes(focus))focus='balanced';
+let state={articles:[],sources:[],view:'briefing',loading:true,error:null,summaryMode:'publisher'};
+let toastTimer,loadVersion=0;
 function toast(message){$('#toast').textContent=message;$('#toast').classList.remove('hidden');clearTimeout(toastTimer);toastTimer=setTimeout(()=>$('#toast').classList.add('hidden'),3200)}
+function persist(key,value){try{localStorage.setItem(key,JSON.stringify(value))}catch{toast('Changes will last for this visit. Browser storage is unavailable.')}}
 function relative(date){if(!date)return 'Time unavailable';const mins=Math.max(0,Math.floor((Date.now()-new Date(date))/60000));if(mins<1)return 'Just now';if(mins<60)return mins+'m ago';if(mins<1440)return Math.floor(mins/60)+'h ago';return new Date(date).toLocaleDateString(undefined,{month:'short',day:'numeric'})}
+const bookmark='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4V3Z"/></svg>';
 function sourceFor(a){return state.sources.find(s=>s.id===a.sourceId)||{color:'#376c56',mark:a.source?.slice(0,2)||'N'}}
-function meta(a){const s=sourceFor(a);return '<span class="source-mark" style="--source-color:'+escape(s.color)+'">'+escape(s.mark)+'</span><span class="source-name">'+escape(a.source)+'</span><span class="separator">·</span><time datetime="'+escape(a.publishedAt||'')+'">'+escape(relative(a.publishedAt))+'</time>'+(a.subscription?'<span class="subscription">Subscription</span>':'')}
-function balanced(items){const groups=new Map();for(const a of items){if(!groups.has(a.sourceId))groups.set(a.sourceId,[]);groups.get(a.sourceId).push(a)}const out=[];while([...groups.values()].some(g=>g.length)){for(const g of groups.values())if(g.length)out.push(g.shift())}return out}
-function enabledArticles(){return state.articles.filter(a=>!disabled.includes(a.sourceId))}
-function filtered(){let items=(state.view==='saved'?saved:enabledArticles()).filter(a=>(state.topic==='All stories'||a.topics.includes(state.topic))&&(!state.query||(a.title+' '+a.summary+' '+a.source).toLowerCase().includes(state.query.toLowerCase())));items.sort((a,b)=>(Date.parse(b.publishedAt)||0)-(Date.parse(a.publishedAt)||0));return state.sort==='balanced'?balanced(items):items}
-function articleCard(a){const isSaved=saved.some(s=>s.id===a.id);return '<article class="article"><div><div class="article-meta">'+meta(a)+'</div><h3><button data-detail="'+escape(a.id)+'">'+escape(a.title)+'</button></h3><p>'+escape(a.summary||'This publisher did not provide a summary. Read the original article for details.')+'</p><div class="article-foot"><span class="topic-tag">'+escape(a.topics.filter(t=>t!==a.group).slice(0,2).join(' · ')||a.group)+'</span><a class="read-link" href="'+escape(safeURL(a.url))+'" target="_blank" rel="noopener noreferrer">Read article ↗</a></div></div><button class="save-button '+(isSaved?'saved':'')+'" data-save="'+escape(a.id)+'" aria-label="'+(isSaved?'Remove saved article: ':'Save article: ')+escape(a.title)+'" aria-pressed="'+isSaved+'">'+svg('bookmark')+'</button></article>'}
+function storyCard(a,index){const source=sourceFor(a),isSaved=saved.some(s=>s.id===a.id);const bullets=(Array.isArray(a.bullets)&&a.bullets.length?a.bullets:[a.summary||a.title]).slice(0,5);return '<article class="story-card"><div class="story-heading"><span class="story-rank" aria-label="Rank '+(index+1)+'">'+String(index+1).padStart(2,'0')+'</span><div><div class="story-kicker"><span class="category">'+escape((a.topics||[]).find(t=>!['News','Technology'].includes(t))||a.group)+'</span><span>·</span><span>'+escape(a.source)+'</span><span>·</span><time datetime="'+escape(a.publishedAt||'')+'">'+escape(relative(a.publishedAt))+'</time></div><h2>'+escape(a.title)+'</h2></div></div><ul class="story-bullets">'+bullets.map(b=>'<li>'+escape(b)+'</li>').join('')+'</ul><div class="story-footer"><details class="story-ranking"><summary>Why this story?</summary><div class="ranking-explanation">'+(a.reasons||['Saved from an earlier briefing']).map(r=>'<span class="rank-reason">'+escape(r)+'</span>').join('')+'</div></details><div class="story-actions">'+(a.subscription?'<span class="summary-limit" title="Summary uses the publisher’s public feed abstract">Feed abstract</span>':'')+'<a href="'+escape(safeURL(a.url))+'" target="_blank" rel="noopener noreferrer" aria-label="Original source: '+escape(a.title)+'">Source ↗</a><button class="save-button '+(isSaved?'saved':'')+'" data-save="'+escape(a.id)+'" aria-label="'+(isSaved?'Unsave: ':'Save: ')+escape(a.title)+'" aria-pressed="'+isSaved+'">'+bookmark+'</button></div></div></article>'}
 function render(){
-  const items=filtered();$('#saved-count').textContent=saved.length||'';
-  document.querySelectorAll('[data-view]').forEach(b=>{const on=b.dataset.view===state.view;b.classList.toggle('active',on);if(on)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
-  document.querySelectorAll('[data-topic]').forEach(b=>{const on=b.dataset.topic===state.topic;b.classList.toggle('active',on);b.setAttribute('aria-pressed',on)});
-  $('#feed-title').textContent=state.view==='saved'?'Your reading list':state.topic==='All stories'?'The latest perspective':state.topic;
-  $('#page-title').textContent=state.view==='saved'?'Good stories, kept.':'Your daily perspective.';
-  $('#page-subtitle').textContent=state.view==='saved'?'A little reading for when you have a little time.':'The world moves fast. Get the context, then get on with your day.';
-  $('#brief-banner').classList.toggle('hidden',state.view==='saved');
-  $('#results-label').textContent=state.loading?'Connecting to publishers…':items.length+' '+(items.length===1?'article':'articles')+(state.query?' matching “'+state.query+'”':state.view==='saved'?' in your reading list':' from your selected sources');
-  if(state.loading&&state.view!=='saved')$('#articles').innerHTML='<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
-  else if(items.length)$('#articles').innerHTML=items.slice(0,state.limit).map(articleCard).join('');
-  else $('#articles').innerHTML='<div class="empty"><h3>'+(state.view==='saved'&&!saved.length?'Make room for a good read.':state.error?'The briefing is taking a moment.':'A quieter corner of the news.')+'</h3><p>'+(state.view==='saved'&&!saved.length?'Tap the bookmark on any article to save it here.':state.error?'We could not reach the news service. Use refresh to try again.':'No articles match these filters. Try another topic or change your sources.')+'</p><button class="outline-button" data-reset>Reset filters</button></div>';
-  $('#load-more').classList.toggle('hidden',state.loading||items.length<=state.limit);
-  $('#load-more').textContent='Show more articles ('+Math.max(0,items.length-state.limit)+' remaining)';
-  const live=state.sources.filter(s=>s.status==='live').length;
-  const failed=state.sources.filter(s=>s.status!=='live');
-  $('#notice').classList.toggle('hidden',!state.error&&!failed.length);
-  $('#notice').textContent=state.error||(failed.length?failed.map(s=>s.name).join(', ')+(failed.length===1?' is':' are')+' temporarily unavailable or showing cached articles. '+(state.articles.length?'Available stories are shown below.':'No stories are available. Use refresh to try again.'):'');
-  $('#sources-count').textContent=live+' / '+state.sources.length+' feeds available';
-  $('#rail-sources').innerHTML=state.sources.map(s=>'<div class="source-row"><span class="source-mark" style="--source-color:'+escape(s.color)+'">'+escape(s.mark)+'</span><div class="source-row-info">'+escape(s.name)+'<small>'+escape(disabled.includes(s.id)?'Hidden from your briefing':s.group)+'</small></div><span class="source-led '+escape(s.status)+'" role="img" aria-label="'+escape(s.status)+'" title="'+escape(s.status)+'"></span></div>').join('');
-  $('#digest-button').disabled=state.loading||!enabledArticles().length;
+ const items=state.view==='saved'?saved:state.articles;
+ $('#saved-count').textContent=saved.length||'';
+ document.querySelectorAll('[data-view]').forEach(b=>{const active=b.dataset.view===state.view;b.classList.toggle('active',active);if(active)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current')});
+ $('#page-title').textContent=state.view==='saved'?'Worth keeping.':'The important part.';
+ $('#page-subtitle').textContent=state.view==='saved'?'The stories and takeaways you saved.':'Your top 10 stories. Ranked by importance. Summarized in up to five bullets each.';
+ $('#brief-toolbar').classList.toggle('hidden',state.view==='saved');
+ $('#story-count').textContent=state.loading&&!state.articles.length?'—':state.articles.length;
+ const bulletCount=state.articles.reduce((n,a)=>n+(a.bullets?.length||1),0);
+ const words=state.articles.reduce((n,a)=>n+(a.bullets||[a.summary||'']).join(' ').split(/\s+/).length,0);
+ $('#takeaway-count').textContent=state.loading&&!state.articles.length?'—':bulletCount;
+ $('#read-time').textContent=state.loading&&!state.articles.length?'—':Math.max(1,Math.ceil(words/220));
+ $('#focus').value=focus;
+ if(state.loading&&!items.length)$('#stories').innerHTML='<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
+ else if(items.length)$('#stories').innerHTML=items.map(storyCard).join('');
+ else $('#stories').innerHTML='<div class="empty"><h3>'+(state.view==='saved'?'Keep a little perspective.':state.error?'The briefing is taking a moment.':'No recent stories from these sources.')+'</h3><p>'+(state.view==='saved'?'Save a story to keep its takeaways here.':state.error?'Try loading your briefing again.':'Choose more sources to build your top 10.')+'</p><button class="outline-button error-action" '+(state.view==='saved'?'data-view="briefing"':state.error?'data-retry':'data-sources')+'>'+(state.view==='saved'?'Back to today':state.error?'Try again':'Choose sources')+'</button></div>';
+ $('#stories').classList.toggle('page-loading',state.loading&&items.length>0);
+ $('#finish').classList.toggle('hidden',!items.length||state.view==='saved'||state.loading);
+ $('#finish-copy').textContent=state.articles.length===10?'Ten stories. You’re caught up.':state.articles.length+' recent stories available from your sources.';
+ const failed=state.sources.filter(s=>s.status!=='live');
+ $('#notice').classList.toggle('hidden',!state.error&&!failed.length);
+ $('#notice').textContent=state.error||(failed.length?failed.map(s=>s.name).join(', ')+' temporarily unavailable or using cached reporting. The briefing uses the available sources.':'');
+ $('#rail-sources').innerHTML=state.sources.map(s=>'<div class="source-row"><span class="source-mark" style="--source-color:'+escape(s.color)+'">'+escape(s.mark)+'</span><div class="source-row-info">'+escape(s.name)+'<small>'+escape(disabled.includes(s.id)?'Not included':s.group)+'</small></div><span class="source-led '+escape(s.status)+'" title="'+escape(s.status)+'" role="img" aria-label="'+escape(s.status)+'"></span></div>').join('');
+ $('#sources-count').textContent=state.sources.length?state.sources.filter(s=>s.status==='live').length+' of '+state.sources.length+' feeds available':'Connecting to publishers…';
+ $('#summary-note').textContent=state.summaryMode==='ai'?'Summaries are generated from available source text. Sources with limited text may have fewer takeaways.':'Takeaways are extracted from accessible article text and publisher feeds. A shorter source produces fewer bullets; missing details are never filled in.';
+ $('#refresh').disabled=state.loading;$('#refresh svg').classList.toggle('spinner',state.loading);
 }
-async function loadNews(){if(!state.loading){state.loading=true;render()}$('#refresh').disabled=true;$('#refresh svg').classList.add('spinner');try{const response=await fetch('/api/news');if(!response.ok)throw new Error('News service returned '+response.status);const data=await response.json();state.articles=data.articles;state.sources=data.sources;state.error=null;$('#updated').textContent='Fetched '+new Date(data.fetchedAt).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'});$('#updated').title='Publisher feeds refresh every 5 minutes';}catch{state.error='We could not reach the news service. Check your connection and try refresh.';$('#updated').textContent='Connection unavailable'}finally{state.loading=false;$('#refresh').disabled=false;$('#refresh svg').classList.remove('spinner');render()}}
-function findArticle(id){return state.articles.find(a=>a.id===id)||saved.find(a=>a.id===id)}
-function toggleSave(id){const a=findArticle(id);if(!a)return;const index=saved.findIndex(s=>s.id===id);if(index>=0){saved.splice(index,1);toast('Removed from your reading list')}else{saved.unshift(a);toast('Saved to your reading list')}persist('techbrief-saved',saved);render();if(activeArticle?.id===id)$('#detail-save').textContent=saved.some(s=>s.id===id)?'Remove from saved':'Save for later'}
-function openDialog(id){const dialog=$(id);if(!dialog.open)dialog.showModal()}
-function openDetail(id){const a=findArticle(id);if(!a)return;activeArticle=a;$('#detail-meta').innerHTML=meta(a);$('#detail-title').textContent=a.title;$('#detail-summary').textContent=a.summary||'This feed did not include a description. Open the original article to read the story.';$('#detail-link').href=safeURL(a.url);$('#detail-link').textContent='Read on '+a.source+' ↗';$('#detail-save').textContent=saved.some(s=>s.id===a.id)?'Remove from saved':'Save for later';$('#detail-note').textContent='Publisher feed summary, shortened for reading. '+(a.subscription?'Your student subscription may unlock this article when you sign in on nytimes.com. ':'')+'Full article access is handled by the publisher.';openDialog('#detail-dialog')}
-function showSources(){
- $('#source-options').innerHTML=state.sources.map(s=>'<div class="source-option"><span class="source-mark" style="--source-color:'+escape(s.color)+'">'+escape(s.mark)+'</span><div><strong>'+escape(s.name)+'</strong><p>'+escape(s.description)+'</p><div class="health '+(s.status==='live'?'':'error')+'">'+(s.status==='live'?s.count+' articles in feed':escape(s.error||'Temporarily unavailable'))+'</div><a href="'+escape(safeURL(s.url))+'" target="_blank" rel="noopener noreferrer">View publisher feed ↗</a></div><input type="checkbox" data-source="'+escape(s.id)+'" aria-label="Include '+escape(s.name)+'" '+(disabled.includes(s.id)?'':'checked')+'></div>').join('');
- if(!state.sources.length)$('#source-options').innerHTML='<p class="dialog-copy">Sources will appear after the news service connects. Close this panel and try refresh.</p>';
- openDialog('#sources-dialog');
-}
-function showDigest(){const seen=new Set();const items=[...enabledArticles()].sort((a,b)=>(Date.parse(b.publishedAt)||0)-(Date.parse(a.publishedAt)||0)).filter(a=>{if(seen.has(a.sourceId))return false;seen.add(a.sourceId);return true}).slice(0,6);$('#digest-items').innerHTML=items.map((a,i)=>'<article class="digest-item"><div class="article-meta"><span>'+String(i+1).padStart(2,'0')+'</span><span class="separator">/</span>'+meta(a)+'</div><h3>'+escape(a.title)+'</h3><p>'+escape(a.summary||'Open the original article for the full story.')+'</p><a class="read-link" href="'+escape(safeURL(a.url))+'" target="_blank" rel="noopener noreferrer">Read original ↗</a></article>').join('');openDialog('#digest-dialog')}
-document.addEventListener('click',event=>{const save=event.target.closest('[data-save]');if(save){toggleSave(save.dataset.save);return}const detail=event.target.closest('[data-detail]');if(detail){openDetail(detail.dataset.detail);return}const view=event.target.closest('[data-view]');if(view){state.view=view.dataset.view;state.topic='All stories';state.limit=12;state.query='';$('#search').value='';$('#clear-search').classList.add('hidden');render();return}const topic=event.target.closest('[data-topic]');if(topic){state.topic=topic.dataset.topic;state.limit=12;render();return}if(event.target.closest('[data-sources]')){showSources();return}if(event.target.closest('[data-close]')){event.target.closest('dialog').close();return}if(event.target.closest('[data-reset]')){state.topic='All stories';state.query='';state.limit=12;disabled=[];persist('techbrief-disabled',disabled);$('#search').value='';$('#clear-search').classList.add('hidden');render();return}if(event.target.closest('[data-method]'))openDialog('#method-dialog')});
-document.addEventListener('change',event=>{const input=event.target.closest('[data-source]');if(!input)return;disabled=disabled.filter(id=>id!==input.dataset.source);if(!input.checked)disabled.push(input.dataset.source);persist('techbrief-disabled',disabled);state.limit=12;render()});
-$('#search').addEventListener('input',e=>{state.query=e.target.value.trim();state.limit=12;$('#clear-search').classList.toggle('hidden',!e.target.value);render()});
-$('#clear-search').onclick=()=>{$('#search').value='';state.query='';$('#clear-search').classList.add('hidden');render();$('#search').focus()};
-$('#sort').onchange=e=>{state.sort=e.target.value;render()};$('#load-more').onclick=()=>{state.limit+=12;render()};$('#refresh').onclick=loadNews;$('#digest-button').onclick=showDigest;$('#detail-save').onclick=()=>toggleSave(activeArticle.id);
-document.querySelectorAll('dialog').forEach(d=>d.addEventListener('click',e=>{if(e.target===d){const r=d.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)d.close()}}));
+async function loadNews(){const version=++loadVersion;state.loading=true;state.error=null;render();try{const params=new URLSearchParams({focus,sources:ALL_SOURCES.filter(id=>!disabled.includes(id)).join(',')});const res=await fetch('/api/news?'+params);if(!res.ok)throw new Error('service');if(!(res.headers.get('Content-Type')||'').includes('application/json'))throw new Error('signin');const data=await res.json();if(version!==loadVersion)return;if(!Array.isArray(data.articles))throw new Error('service');state.articles=data.articles.slice(0,10);state.sources=data.sources;state.summaryMode=data.summaryMode;$('#updated').textContent='Updated '+new Date(data.fetchedAt).toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'});}catch(error){if(version!==loadVersion)return;state.error=error.message==='signin'?'Your session needs a refresh. Reload this page to sign in again.':'The briefing service is temporarily unavailable. Try again in a moment.';$('#updated').textContent='Update unavailable'}finally{if(version===loadVersion){state.loading=false;render()}}}
+function toggleSave(id){const a=state.articles.find(a=>a.id===id)||saved.find(a=>a.id===id);if(!a)return;const at=saved.findIndex(s=>s.id===id);if(at>=0){saved.splice(at,1);toast('Removed from saved stories')}else{saved.unshift(a);saved=saved.slice(0,100);toast('Story and takeaways saved')}persist('techbrief-saved',saved);render()}
+function showSources(){const options=state.sources.length?state.sources:ALL_SOURCES.map(id=>({id,name:id,description:'Feed connection is pending.',color:'#376c56',mark:'N',url:'https://www.bbc.com/news'}));$('#source-options').innerHTML=options.map(s=>'<div class="source-option"><span class="source-mark" style="--source-color:'+escape(s.color)+'">'+escape(s.mark)+'</span><div><strong>'+escape(s.name)+'</strong><p>'+escape(s.description)+'</p></div><input type="checkbox" data-source="'+escape(s.id)+'" aria-label="Include '+escape(s.name)+'" '+(disabled.includes(s.id)?'':'checked')+'></div>').join('');$('#sources-dialog').showModal()}
+document.addEventListener('click',event=>{const save=event.target.closest('[data-save]');if(save){toggleSave(save.dataset.save);return}const view=event.target.closest('[data-view]');if(view){state.view=view.dataset.view;render();return}if(event.target.closest('[data-sources]')){showSources();return}if(event.target.closest('[data-method]')){$('#method-dialog').showModal();return}if(event.target.closest('[data-close]')){event.target.closest('dialog').close();return}if(event.target.closest('[data-retry]'))loadNews()});
+$('#apply-sources').onclick=()=>{disabled=Array.from($('#source-options').querySelectorAll('[data-source]')).filter(input=>!input.checked).map(input=>input.dataset.source);persist('techbrief-disabled',disabled);$('#sources-dialog').close();loadNews()};
+$('#focus').onchange=e=>{focus=e.target.value;persist('techbrief-focus',focus);loadNews()};$('#refresh').onclick=loadNews;
+for(const dialog of document.querySelectorAll('dialog'))dialog.addEventListener('click',event=>{if(event.target===dialog){const r=dialog.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)dialog.close()}});
 $('#date').textContent=new Date().toLocaleDateString(undefined,{weekday:'long',month:'long',day:'numeric',year:'numeric'});
 render();loadNews();
 `;
 
-const HTML = `<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#152d34"><meta name="description" content="Your daily perspective on news and technology. Short publisher summaries, transparent sources, and original articles."><title>TechBrief — Your daily perspective</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%23152d34'/%3E%3Cpath d='M10 15v15m10-20v20m10-17v17' stroke='%23a8c7a2' stroke-width='5'/%3E%3C/svg%3E"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="/style.css"></head>
-<body><a class="skip" href="#main">Skip to articles</a>
-<aside class="sidebar" aria-label="Main navigation"><a class="brand" href="/" aria-label="TechBrief home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>techbrief<span style="color:#a4bc99">.</span></a><div class="tagline">Stay curious. Stay informed.</div>
-<div class="nav-label">Your newsroom</div><nav><button class="nav-item active" data-view="briefing" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>My briefing</button><button class="nav-item" data-view="saved"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4V3Z"/></svg>Saved articles<span class="count" id="saved-count"></span></button><button class="nav-item" data-sources><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z"/></svg>My sources</button></nav>
-<div class="secondary-nav"><div class="nav-line"></div><div class="nav-label">Behind the briefing</div><button class="nav-item" data-method><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 10v7M12 6v1"/></svg>How it works</button></div><div class="sidebar-bottom"><div class="sidebar-note"><span class="tiny-dot"></span>A little clarity, every day.<br>Independent sources.<br>A broader perspective.</div><div class="edition">YOUR PERSONAL EDITION / 01</div></div></aside>
-<div class="shell"><header class="topbar"><div class="date"><b id="date"></b></div><div class="top-right"><span class="status"><span class="tiny-dot"></span><span id="updated" aria-live="polite">Connecting to feeds</span></span><button class="round-button" id="refresh" title="Refresh news" aria-label="Refresh news"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 11.5-2L20 8M4 16l2.5 3A7 7 0 0 0 18 17"/></svg></button><span class="avatar" title="Your personal edition" aria-hidden="true">t.</span></div></header>
-<main class="content" id="main"><div class="intro"><div><div class="eyebrow">A clearer view of what's happening</div><h1 id="page-title">Your daily perspective.</h1><p id="page-subtitle">The world moves fast. Get the context, then get on with your day.</p></div><button class="outline-button" data-sources aria-label="Customize sources"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 7h16M4 17h16M4 12h16"/><circle cx="8" cy="7" r="2" fill="#f7f8f5"/><circle cx="16" cy="12" r="2" fill="#f7f8f5"/><circle cx="10" cy="17" r="2" fill="#f7f8f5"/></svg>Customize sources</button></div>
-<section class="brief-banner" id="brief-banner" aria-labelledby="banner-title"><div><div class="eyebrow"><span class="tiny-dot"></span>THE QUICK READ</div><h2 id="banner-title">A little less noise.<br>A lot more perspective.</h2><p>Up to six stories from across your sources. A quick catch-up on the world and the technology shaping it.</p><button class="solid-button" id="digest-button" disabled>Read my briefing <span aria-hidden="true">↗</span></button></div><div class="banner-art" aria-hidden="true"><span class="orbit"></span><span class="orbit"></span><span class="orbit"></span><span class="art-core"></span><span class="art-dot"></span><span class="art-plus">+</span></div></section>
-<div id="notice" class="notice hidden" role="status"></div>
-<div class="workspace"><section class="feed" aria-labelledby="feed-title"><div class="feed-head"><h2 class="section-title" id="feed-title">The latest perspective</h2><label class="sort">Sort by <select id="sort" aria-label="Sort articles"><option value="balanced">Source balance</option><option value="newest">Newest first</option></select></label></div><div class="tabs" aria-label="Filter articles by topic"><button class="tab active" data-topic="All stories" aria-pressed="true">All stories</button><button class="tab" data-topic="News" aria-pressed="false">World & news</button><button class="tab" data-topic="Technology" aria-pressed="false">Technology</button><button class="tab" data-topic="AI" aria-pressed="false">AI</button><button class="tab" data-topic="Startups" aria-pressed="false">Startups</button><button class="tab" data-topic="Science" aria-pressed="false">Science</button></div><div class="search-wrap"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/></svg><input id="search" type="search" placeholder="Find a story, topic, or publisher…" aria-label="Search articles" autocomplete="off"><button id="clear-search" class="search-clear hidden" aria-label="Clear search">×</button></div><p class="results-label" id="results-label" aria-live="polite"></p><div id="articles"></div><button class="load-more hidden" id="load-more">Show more articles</button></section>
-<aside class="rail" aria-label="About your briefing"><div class="rail-block"><div class="rail-title-row"><h2 class="rail-title">Your sources</h2><button data-sources>Edit ↗</button></div><div id="rail-sources"></div><p class="rail-caption" id="sources-count">Connecting to publisher feeds…</p></div><div class="rail-rule"></div><div class="note-card"><div class="note-icon" aria-hidden="true">↗</div><h3>Your student access,<br>put to good use.</h3><p>New York Times stories are here, too. Open the original and sign in with your student account to keep reading.</p><button data-sources>Explore your sources</button></div><div class="rail-rule"></div><h2 class="rail-title">Good to know</h2><div class="principle"><span aria-hidden="true">↳</span><span>Every story leads back<br>to its original source.</span></div><div class="principle"><span aria-hidden="true">↳</span><span>Short summaries come from<br>the publisher's own feed.</span></div><div class="principle"><span aria-hidden="true">↳</span><span>Your reading list stays<br>in this browser.</span></div></aside></div>
-<footer class="footer"><span>Made for curious minds. Stories belong to their respective publishers.</span><button data-method>Our source approach ↗</button></footer></main></div>
-<dialog id="sources-dialog" aria-labelledby="sources-title"><div class="dialog-top"><div><div class="eyebrow">Build your perspective</div><h2 id="sources-title">A well-rounded newsroom.</h2></div><button class="dialog-close" data-close aria-label="Close sources">×</button></div><p class="dialog-copy">Choose the publishers in your briefing. Changes save automatically in this browser. Feed availability is checked when the briefing refreshes.</p><div id="source-options"></div><div class="method"><strong>Your NYT student subscription</strong>Use your existing login on nytimes.com when you open an article. This app reads the public RSS feed and does not need your account password. Subscription access and developer API access are separate.</div></dialog>
-<dialog id="digest-dialog" aria-labelledby="digest-title"><div class="dialog-top"><div><div class="eyebrow">Your quick read</div><h2 id="digest-title">The briefing.</h2></div><button class="dialog-close" data-close aria-label="Close briefing">×</button></div><p class="dialog-copy">The latest available story from each selected source, up to six. Summaries are shortened publisher descriptions; this is a feed roundup, not a combined or independently verified report.</p><div id="digest-items"></div></dialog>
-<dialog id="detail-dialog" aria-labelledby="detail-title"><div class="dialog-top"><div class="article-meta" id="detail-meta"></div><button class="dialog-close" data-close aria-label="Close article summary">×</button></div><h2 class="detail-title" id="detail-title"></h2><p class="detail-summary" id="detail-summary"></p><div class="detail-actions"><a id="detail-link" class="solid-button" target="_blank" rel="noopener noreferrer">Read original ↗</a><button class="outline-button" id="detail-save">Save for later</button></div><p class="detail-note" id="detail-note"></p></dialog>
-<dialog id="method-dialog" aria-labelledby="method-title"><div class="dialog-top"><div><div class="eyebrow">Transparent by design</div><h2 id="method-title">Where the stories come from.</h2></div><button class="dialog-close" data-close aria-label="Close source approach">×</button></div><p class="dialog-copy"><strong>Connected now.</strong> Publisher RSS feeds from BBC News, NPR, The New York Times, BBC Technology, Ars Technica, and TechCrunch. We retrieve headlines, dates, descriptions, and original links. Feeds refresh on request with a five-minute cache. When a publisher fails, available sources continue working and cached stories are marked.</p><p class="dialog-copy"><strong>How summaries work.</strong> Feed descriptions are cleaned and shortened to 300 characters at a sentence or word boundary. No AI-generated facts or full-article scraping. Articles without descriptions say so. Topic tags use keyword matching. “Source balance” rotates through publishers; it does not measure credibility or importance.</p><p class="dialog-copy"><strong>Planned next.</strong> NYT Top Stories and Article Search APIs for richer discovery; Guardian Open Platform for broader coverage. These require separate developer keys and a review of the applicable terms. Reuters and AP would require licensed access. Primary research and official company announcements would be marked as primary sources.</p><p class="dialog-copy"><strong>Deeper summaries.</strong> A later version can summarize licensed full text or text you provide, with links supporting each claim and explicit uncertainty. A reading subscription alone does not establish permission for automated article ingestion.</p><div class="method"><strong>Personal by default</strong>Your saved articles and source choices are stored in this browser. There is no cross-device account sync. Sign in to each publisher directly to use subscriptions. Read the full source plan at <a href="/source-plan" target="_blank" rel="noopener noreferrer">/source-plan ↗</a>.</div></dialog>
-<div id="toast" class="toast hidden" role="status" aria-live="polite"></div><noscript><p style="padding:30px;margin-left:230px">Enable JavaScript to load articles. You can still read the <a href="/source-plan">source plan</a>.</p></noscript><script src="/app.js" defer></script></body></html>`;
+const HTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#152d34"><meta name="description" content="Ten important news and technology stories, ranked and summarized in up to five bullet points each."><title>TechBrief — Your top 10, in brief</title><link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%23152d34'/%3E%3Cpath d='M10 15v15m10-20v20m10-17v17' stroke='%23a8c7a2' stroke-width='5'/%3E%3C/svg%3E"><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="/style.css"></head><body><a class="skip" href="#main">Skip to briefing</a>
+<aside class="sidebar" aria-label="Main navigation"><a class="brand" href="/" aria-label="TechBrief home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>techbrief<span style="color:#a4bc99">.</span></a><div class="tagline">Stay curious. Stay informed.</div><div class="nav-label">Your newsroom</div><nav><button class="nav-item active" data-view="briefing" aria-current="page"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/></svg>Daily brief</button><button class="nav-item" data-view="saved"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4V3Z"/></svg>Saved stories<span class="count" id="saved-count"></span></button><button class="nav-item" data-sources><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c5 5 5 13 0 18-5-5-5-13 0-18Z"/></svg>My sources</button></nav><div class="secondary-nav"><div class="nav-line"></div><button class="nav-item" data-method><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 10v7M12 6v1"/></svg>How we choose</button></div><div class="sidebar-bottom"><div class="sidebar-note"><span class="tiny-dot"></span>Less scrolling.<br>More understanding.</div><div class="edition">10 STORIES<br>UP TO 5 TAKEAWAYS EACH</div></div></aside>
+<div class="shell"><header class="topbar"><div class="date"><b id="date"></b></div><div class="top-right"><span class="status"><span class="tiny-dot"></span><span id="updated" aria-live="polite">Preparing your brief</span></span><button class="round-button" id="refresh" aria-label="Refresh briefing" title="Refresh briefing"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 11.5-2L20 8M4 16l2.5 3A7 7 0 0 0 18 17"/></svg></button></div></header>
+<main class="content" id="main"><div class="intro"><div><div class="eyebrow">The world, with the noise turned down</div><h1 id="page-title">The important part.</h1><p id="page-subtitle">Your top 10 stories. Ranked by importance. Summarized in up to five bullets each.</p></div><button class="outline-button" data-sources aria-label="Customize sources"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 7h16M4 17h16M4 12h16"/><circle cx="8" cy="7" r="2" fill="#f7f8f5"/><circle cx="16" cy="12" r="2" fill="#f7f8f5"/><circle cx="10" cy="17" r="2" fill="#f7f8f5"/></svg>My sources</button></div>
+<div class="brief-toolbar" id="brief-toolbar"><div class="brief-stats" aria-live="polite"><span><b id="story-count">—</b> stories</span><span><b id="takeaway-count">—</b> takeaways</span><span>~<b id="read-time">—</b> min read</span></div><label class="focus-label">Prioritize <select id="focus" aria-label="Briefing relevance"><option value="balanced">News + technology</option><option value="technology">More technology</option><option value="world">More world news</option></select></label></div><div id="notice" class="notice hidden" role="status"></div>
+<div class="workspace"><section aria-label="Ranked stories and summaries"><div id="stories" class="brief-list" aria-live="polite"></div><div id="finish" class="brief-finish hidden"><span id="finish-copy">Ten stories. You’re caught up.</span>That’s the brief. Go enjoy the rest of your day.</div><p class="rank-note" id="summary-note"></p></section>
+<aside class="rail" aria-label="Briefing context"><div class="rail-block"><h2 class="rail-title">Chosen for a reason</h2><div class="criteria"><div class="criterion"><span class="criterion-number">01</span><div><strong>Impact over volume</strong><p>Developments affecting public life, the economy, and the technology you use.</p></div></div><div class="criterion"><span class="criterion-number">02</span><div><strong>More than one perspective</strong><p>Independent coverage and a mix of publishers help surface important stories.</p></div></div><div class="criterion"><span class="criterion-number">03</span><div><strong>Relevant right now</strong><p>Recent reporting, with your preferred balance of news and technology.</p></div></div></div></div><div class="rail-rule"></div><div class="rail-title-row"><h2 class="rail-title">Your sources</h2><button data-sources>Edit ↗</button></div><div id="rail-sources"></div><p class="rail-caption" id="sources-count">Connecting to publishers…</p><div class="rail-rule"></div><div class="note-card"><div class="note-icon" aria-hidden="true">✓</div><h3>The takeaways<br>are right here.</h3><p>Read the bullets and move on. Original links are there if you want to check a source or go deeper.</p><button data-method>How the briefing works</button></div></aside></div>
+<footer class="footer"><span>A little context. A lot less scrolling.</span><button data-method>Sources & selection ↗</button></footer></main></div>
+<dialog id="sources-dialog" aria-labelledby="sources-title"><div class="dialog-top"><div><div class="eyebrow">Your newsroom</div><h2 id="sources-title">Choose your sources.</h2></div><button class="dialog-close" data-close aria-label="Close sources">×</button></div><p class="dialog-copy">We select the top 10 from these publishers. Your choices are remembered in this browser.</p><div id="source-options"></div><div class="source-dialog-foot"><button class="solid-button" id="apply-sources">Update my briefing ↗</button></div></dialog>
+<dialog id="method-dialog" aria-labelledby="method-title"><div class="dialog-top"><div><div class="eyebrow">Behind the brief</div><h2 id="method-title">Ten stories worth your time.</h2></div><button class="dialog-close" data-close aria-label="Close selection approach">×</button></div><p class="dialog-copy"><strong>How stories are ranked.</strong> We score reporting by broad public/economic impact, related coverage across independent publishers, freshness, placement in the publisher’s feed, and your technology/news focus. Repeated publishers and similar subjects receive a diversity penalty. This is a transparent heuristic, not an objective measure of importance or a personalized model of you.</p><p class="dialog-copy"><strong>One story, up to five takeaways.</strong> We use text supplied in publisher feeds and accessible article pages. The most relevant factual sentences become concise bullets. Short sources produce fewer bullets. The briefing never invents extra facts to reach five. Article text may include attributed claims and quotes; those remain the publisher’s reporting.</p><p class="dialog-copy"><strong>NYT and subscriptions.</strong> NYT summaries use the public feed abstract. Your student subscription works when you open nytimes.com directly; this app does not receive your password or subscription cookies. Full-text access is not assumed.</p><p class="dialog-copy"><strong>Freshness and availability.</strong> Only stories from the last four days are considered. Publisher feeds refresh on demand with a five-minute in-memory cache. Article text is cached for up to 30 minutes. Failed publishers are marked; fewer than 10 stories are shown when there is insufficient recent reporting.</p><div class="method"><strong>Your preferences stay here</strong>Source choices, relevance preference, and saved stories are stored in this browser. Read the <a href="/source-plan" target="_blank" rel="noopener noreferrer">source plan ↗</a> for details.</div></dialog><div id="toast" class="toast hidden" role="status" aria-live="polite"></div><noscript><p>Enable JavaScript to read your ranked briefing.</p></noscript><script src="/app.js" defer></script></body></html>`;
 
-const PLAN = `TechBrief source plan
-
-CONNECTED NOW
-BBC World: https://feeds.bbci.co.uk/news/world/rss.xml
-BBC Technology: https://feeds.bbci.co.uk/news/technology/rss.xml
-NPR: https://feeds.npr.org/1001/rss.xml
-NYT Top Stories: https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
-Ars Technica: https://feeds.arstechnica.com/arstechnica/index
-TechCrunch: https://techcrunch.com/feed/
-
-We retrieve public RSS headlines, dates, descriptions and original links. Summaries are cleaned descriptions shortened to 300 characters. No full article text or abstractive AI generation is used. No API keys are needed for this version.
-
-YOUR STUDENT SUBSCRIPTION
-Use your NYT login directly on nytimes.com when opening the original article. No password or subscription cookies are collected by this app. API access requires a separate developer application. Reading access does not by itself authorize full-text ingestion or redistribution.
-
-NEXT SOURCES
-1. NYT Top Stories / Article Search API: developer account and appropriate API keys. Store secrets on the server, confirm current limits and terms, retain RSS fallback.
-https://developer.nytimes.com/
-https://github.com/nytimes/public_api_specs/blob/master/top_stories/top_stories_v2.md
-2. Guardian Open Platform: developer key and suitable access tier.
-https://open-platform.theguardian.com/documentation/
-https://open-platform.theguardian.com/access/
-3. Official research releases, arXiv papers and company engineering blogs, clearly labeled as primary sources. https://info.arxiv.org/help/api/index.html
-4. Reuters / AP only through licensed access.
-
-No additional student subscriptions are needed for this MVP. Check existing university library access before paying for more reading subscriptions.
-
-PROCESSING
-Fetch on demand with a five-minute cache and 12-second feed timeouts. Retain previous in-memory stories if a feed fails and mark it stale. Other feeds continue working. Normalize HTTPS URLs, remove tracking parameters, deduplicate URLs and exact normalized titles. Sort chronologically or rotate through each publisher. Topic labels use keyword matching, not semantic classification. Different reports about the same event are not yet clustered. Missing publication dates remain missing; older feed entries show their original dates. There is no background refresh or durable article archive.
-
-SUMMARY ROADMAP
-For richer summaries use licensed article text or text provided by the user. Ground factual bullets in original links, retain disagreement and uncertainty, and distinguish reporting, opinion and company claims. Event clustering and cross-source synthesis are future work.
-
-SOURCE REFERENCES
-NYT RSS directory/terms: https://www.nytimes.com/rss
-BBC feed help: https://www.bbc.co.uk/news/10628494
-NPR feed directory: https://www.npr.org/rss/
-Ars feed directory: https://arstechnica.com/rss-feeds/
-TechCrunch feed: https://techcrunch.com/feed/
-
-Personal reading tool. Keep publisher attribution and original links. Review current publisher terms before broader distribution, commercial use or full-text features. RSS availability does not imply unlimited reuse rights. The hosted app is private by default.
-
-STORAGE
-Reading list and source preferences are browser-local. No account sync, password collection, scheduled email delivery, or paywall bypass. Deployment source and a more detailed plan are in the GitHub repository.
-`;
+const PLAN = "# TechBrief source and selection plan\n\n## The reading experience\n\nThe home page is a ranked briefing of at most **10 stories**, with **one to five factual bullets per story**, expanded inline. Original links are optional references. There is no full feed, load-more button, or requirement to open individual article dialogs. If fewer than ten distinct recent stories are available, the app shows fewer rather than filling the list with old or repeated reporting.\n\n## Connected sources\n\n| Publisher | Coverage | Feed |\n| --- | --- | --- |\n| BBC News | World affairs | https://feeds.bbci.co.uk/news/world/rss.xml |\n| NPR | US and international news | https://feeds.npr.org/1001/rss.xml |\n| New York Times | Top stories | https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml |\n| BBC Technology | Technology | https://feeds.bbci.co.uk/news/technology/rss.xml |\n| Ars Technica | Technology and science | https://feeds.arstechnica.com/arstechnica/index |\n| TechCrunch | Technology and startups | https://techcrunch.com/feed/ |\n\n## Importance and relevance\n\n1. Consider only reporting published within the last four days. Missing dates are excluded from the ranked edition.\n2. Score public/economic impact using documented keyword rules: major political developments, public safety, security, economic policy and broad technology changes receive more weight than deals, reviews and soft-news features.\n3. Add signals for freshness, publisher feed placement and related headlines from independent publishers. BBC News and BBC Technology count as one publisher for coverage/diversity.\n4. Apply the visitor's **News + technology**, **More technology**, or **More world news** preference.\n5. Greedily select up to ten articles, penalizing repeated publishers and suppressing closely matching event headlines. Variations such as “buy out” and “buyouts” are normalized.\n\nThis is an explicit heuristic, not an objective importance score, an editorial guarantee, or a learned profile of the visitor. Related-coverage detection uses normalized headline overlap; it can miss paraphrases or group distinct angles too aggressively. Feed order is used as placement, not assumed to represent a publisher's editorial ranking. Each story includes a short explanation of its ranking signals.\n\n## Summaries you can read in the app\n\nFor selected stories, use article text already included in the feed where available. Otherwise, attempt to read the publicly accessible article page on that publisher's allowlisted domain. Use structured `articleBody` or semantic article/main paragraphs; remove photo credits, captions, promotional text and link-heavy related-story lists. Never forward user cookies or fetch arbitrary user-supplied URLs. Follow only redirects that remain on the publisher's domain, with a bounded timeout and response size.\n\nGenerate an extractive summary: split source text into sentences, score relevance to the headline plus concrete details and developments, suppress repetitive sentences, choose up to five, and preserve their source order. Decimal numbers and common abbreviations remain intact. Long sentences are shortened at a word/sentence boundary. These are selected source sentences, not AI-written paraphrases or independently verified claims. The app does not invent extra bullets when the available text is short.\n\nNYT stories use the public RSS abstract. A user's reading subscription is not ingested and does not authorize backend full-text access. Pages explicitly marked inaccessible for free are not used for article text. When access or extraction fails, use the feed text and retain attribution. Short abstracts may yield only one or two bullets.\n\n## Your NYT student subscription\n\nUse your existing login directly on nytimes.com if you choose to open the original. The app does not collect your password or subscription cookies. No extra student subscriptions are necessary for the working briefing. Developer API access is separate from reading access.\n\nNYT developer documentation: https://developer.nytimes.com/\nNYT Top Stories specification: https://github.com/nytimes/public_api_specs/blob/master/top_stories/top_stories_v2.md\nNYT RSS directory and terms: https://www.nytimes.com/rss\n\n## Refresh, errors and privacy\n\nFeeds load on demand with a five-minute in-memory cache and twelve-second per-feed timeouts. Public article text is cached in memory for thirty minutes, capped at forty entries. A browser may reuse an API response for one minute. No platform Cache API is required. One publisher's failure does not prevent other reporting from loading; previous feed entries may be retained and the source marked stale.\n\nSource exclusions, relevance preference and saved summary snapshots stay in browser local storage. Hosted and localhost lists are separate. There is no account sync, durable article archive, background scheduler, or notification delivery.\n\n## Further integrations\n\n- NYT Top Stories / Article Search APIs: separate developer application and server-side API key. Confirm current quotas and permitted content before enabling.\n- Guardian Open Platform: developer key and an access tier appropriate to the use. https://open-platform.theguardian.com/documentation/\n- Licensed Reuters/AP coverage if required.\n- Optional AI paraphrasing with a separately authorized model API connection, validation against the provided source text, and explicit handling of limited-text articles. The currently working version uses extractive summaries and makes no model API calls.\n\nPublisher references: https://www.bbc.co.uk/news/10628494 , https://www.npr.org/rss/ , https://arstechnica.com/rss-feeds/ , https://techcrunch.com/feed/\n\nKeep this personal reading tool private, preserve attribution and original links, and review the publishers' applicable terms before broader distribution or commercial use. Do not assume RSS or subscription access grants unlimited reuse rights.\n";
