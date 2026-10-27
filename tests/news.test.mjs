@@ -50,7 +50,7 @@ test('a failed publisher retains only its own previous stories while other feeds
   assert.equal(result.sources[1].status, 'live');
   assert.equal(result.sources[0].count, 1);
   assert.ok(result.articles.some(a => a.url === old.url));
-  assert.equal(result.articles.length, 6);
+  assert.equal(result.articles.length, SOURCES.length);
 });
 
 test('an all-source failure returns an explicit empty edition, not invented stories', async () => {
@@ -63,7 +63,7 @@ test('worker serves a valid client script, app shell and source plan; rejects un
   const request = path => worker.fetch(new Request('http://localhost' + path), {}, {});
   const home = await request('/');
   assert.equal(home.status, 200);
-  assert.match(await home.text(), /Your top 10 stories/);
+  assert.match(await home.text(), /The tech worth knowing/);
   const script = await request('/app.js');
   const client = await script.text();
   assert.doesNotThrow(() => new Script(client));

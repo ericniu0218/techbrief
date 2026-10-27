@@ -1,12 +1,60 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rankArticles, makeBriefing, extractBullets, extractArticleText, readPublicArticle, SOURCES } from '../worker/index.js';
+import { rankArticles, makeBriefing, extractBullets, extractArticleText, readPublicArticle, classifyGroup, isDiscovery, SOURCES } from '../worker/index.js';
 
 const now = Date.now();
 function story(index, extra = {}) {
   const source = SOURCES[index % SOURCES.length];
   return { id: 'https://example.org/' + index, url: 'https://example.org/' + index, title: 'Report number ' + index, summary: 'The publisher reports a specific development with available details.', sourceText: '', sourceId: source.id, source: source.name, group: source.group, topics: [source.group], publishedAt: new Date(now - 3 * 3600000).toISOString(), feedPosition: index, ...extra };
 }
+
+function mixedPool() {
+  const names=['Atlas','Beacon','Cobalt','Delta','Evergreen','Fable','Granite','Harbor','Indigo','Juniper','Keystone','Lagoon'];
+  const tech=names.map((name,i)=>story(i+30,{title:name+' systems update',summary:'An infrastructure provider reports a routine engineering development.',group:'Technology',sourceId:['ars','tc','bbc-tech'][i%3]}));
+  const discoveries=[story(70,{title:'Aurora unveils new smart glasses',summary:'A lightweight prototype device introduces a hands-free interface.',group:'Technology',sourceId:'ars-gear'}),story(71,{title:'Kestrel launches a compact desktop robot',summary:'The autonomous device brings a new approach to household tasks.',group:'Technology',sourceId:'tc'})];
+  const news=['Parliament passes national security legislation','Earthquake triggers a regional evacuation','Central bank changes interest rates','Court rules on a constitutional dispute','Ceasefire ends an international conflict'].map((title,i)=>story(i+80,{title,summary:'A major public development affects millions of residents.',group:'News',sourceId:['bbc-world','npr','nyt'][i%3]}));
+  return [...tech,...discoveries,...news];
+}
+
+test('the default edition has eight tech stories, two news stories and two discoveries within the ten', () => {
+  const articles=rankArticles(mixedPool(),{now});
+  assert.equal(articles.length,10);
+  assert.equal(articles.filter(a=>a.group==='Technology').length,8);
+  assert.equal(articles.filter(a=>a.group==='News').length,2);
+  assert.equal(articles.filter(a=>a.discovery).length,2);
+});
+
+test('the alternate mix reserves seven tech stories and three news stories', () => {
+  const articles=rankArticles(mixedPool(),{now,focus:'balanced'});
+  assert.equal(articles.length,10);
+  assert.equal(articles.filter(a=>a.group==='Technology').length,7);
+  assert.equal(articles.filter(a=>a.group==='News').length,3);
+  assert.equal(articles.filter(a=>a.discovery).length,2);
+});
+
+test('category shortages fill from available recent reporting without inventing the requested mix', () => {
+  const pool=mixedPool().filter(a=>a.group==='Technology');
+  const edition=makeBriefing({articles:pool,sources:SOURCES,fetchedAt:new Date(now).toISOString()},{now});
+  assert.equal(edition.articles.length,10);
+  assert.equal(edition.mix.technology,10);
+  assert.equal(edition.mix.news,0);
+  assert.deepEqual(edition.mix.target,{technology:8,news:2});
+});
+
+test('new devices qualify for discovery while discounts, failures and layoffs do not', () => {
+  assert.ok(isDiscovery(story(0,{group:'Technology',title:'A startup unveils a new quantum processor'})));
+  assert.equal(isDiscovery(story(0,{group:'Technology',title:'Best new iPhone discounts and deals'})),false);
+  assert.equal(isDiscovery(story(0,{group:'Technology',title:'New iPhone screens are already failing'})),false);
+  assert.equal(isDiscovery(story(0,{group:'Technology',title:'Apple will replace new handsets with screen problems'})),false);
+  assert.equal(isDiscovery(story(0,{group:'Technology',title:'Robot startup announces layoffs'})),false);
+});
+
+test('a publisher health story does not count as tech, but computing discoveries do', () => {
+  const ars=SOURCES.find(s=>s.id==='ars');
+  assert.equal(classifyGroup(ars,'Worms found in a patient’s eyes','A clinical report.',[], 'https://arstechnica.com/health/2026/report'),'News');
+  assert.equal(classifyGroup(ars,'A quantum processor demonstrates a new breakthrough','Research findings.',[], 'https://arstechnica.com/science/2026/report'),'Technology');
+  assert.equal(classifyGroup(SOURCES[2],'OpenAI releases a new AI model','A company announcement.'),'Technology');
+});
 
 test('importance outranks a newer product deal; the edition contains at most ten ranked stories', () => {
   const deal = story(0, { title: 'Best phone deals and discount coupons', publishedAt: new Date(now).toISOString() });
@@ -49,9 +97,9 @@ test('sentence boundaries preserve decimal numbers and abbreviations, and discar
 
 test('related headlines across independent publishers count as coverage; BBC sections are one publisher', () => {
   const title = 'National security agency announces major software vulnerability';
-  const result = rankArticles([story(0,{title}),story(3,{title:title+' details'}),story(4,{title:title+' response'})],{now});
-  const bbc=result.find(a=>a.sourceId==='bbc-world');
-  assert.equal(bbc.coverage,2);
+  const result = rankArticles([story(0,{title}),story(3,{title:title+' details'}),story(4,{title:title+' response'}),story(6,{title:title+' update'})],{now});
+  assert.equal(result.length,1);
+  assert.equal(result[0].coverage,2);
 });
 
 test('each story has one to five source-grounded bullets, without filler or duplicate sentences', () => {

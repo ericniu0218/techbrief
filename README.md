@@ -1,6 +1,6 @@
 # TechBrief
 
-**Ten important news and technology stories. Up to five bullet points each. Read everything in the app.**
+**Eight tech stories, two news stories, and a little new-tech discovery. Up to five bullet points each.**
 
 ## Run locally
 
@@ -14,11 +14,12 @@ Open http://localhost:3000. Set `PORT` for another port. An initial edition can 
 
 ## What it does
 
-- Returns at most ten recent stories, ranked by impact, related independent coverage, recency, feed placement and the chosen news/technology focus.
+- Returns at most ten recent stories: **8 tech / 2 news** by default or **7 tech / 3 news**. Selected stories remain ordered by impact and relevance.
+- Reserves up to two slots within the tech allocation for new products, devices, useful tools or emerging technology, marked **New & notable**. Category shortages fill from available reporting and actual counts are displayed.
 - Displays one to five source-grounded bullets directly beneath every headline. Original links are optional.
 - Suppresses matching event headlines and reduces repetition from a single publisher.
-- Lets you prioritize **News + technology**, **More technology**, or **More world news** and choose publishers.
-- Uses BBC News, NPR, NYT, BBC Technology, Ars Technica and TechCrunch.
+- Lets you prioritize **8 tech / 2 news** or **7 tech / 3 news** and choose publishers.
+- Uses BBC News, NPR, NYT, BBC Technology, Ars Technica, Ars Gear & Gadgets and TechCrunch.
 - Reads publicly available article text when possible. Falls back to publisher feed abstracts when it is unavailable.
 - Preserves saved story/summary snapshots and preferences in this browser.
 
@@ -33,7 +34,7 @@ npm run build
 npm run validate
 ```
 
-Tests cover the ten-story limit, importance/relevance ordering, repeated events, summary limits, article extraction, subscription/redirect boundaries, cache restrictions, partial failure recovery, RSS parsing and client syntax. The live smoke test exercises the actual API handler and confirms ranked summaries from real publishers.
+Tests cover the ten-story limit, 8/2 and 7/3 mixes, discovery inclusion, category-shortage recovery, importance/relevance ordering, repeated events, summary limits, article extraction, subscription/redirect boundaries, cache restrictions, partial failure recovery, RSS parsing and client syntax. The live smoke test exercises the actual API handler and confirms ranked summaries from real publishers.
 
 ## Structure
 
@@ -48,7 +49,7 @@ tests/                         Product/ranking, extraction and host regression t
 SOURCE_PLAN.md                 Sources, ranking, summary method and limitations
 ```
 
-The ES module Worker exports `fetch(request, env, ctx)`. HTML/CSS/client JavaScript are embedded and served through separate routes. The API `/api/news` accepts `focus=balanced|technology|world` and an optional comma-separated allowlist of `sources`. It exposes at most ten summary objects and never returns full article bodies. The app uses the same endpoint locally and in production.
+The ES module Worker exports `fetch(request, env, ctx)`. HTML/CSS/client JavaScript are embedded and served through separate routes. The API `/api/news` accepts `focus=technology` (default 8/2) or `focus=balanced` (7/3); the legacy `world` value remains supported as 2/8 and an optional comma-separated allowlist of `sources`. It exposes at most ten summary objects and never returns full article bodies. The app uses the same endpoint locally and in production.
 
 Feeds use a five-minute in-memory cache; public article text uses a bounded thirty-minute cache. Browser API responses are private and may be reused for one minute. The platform's restricted default Cache API is never accessed. There is no background scheduler, durable archive, account sync or password collection.
 

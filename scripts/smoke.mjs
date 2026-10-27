@@ -6,12 +6,15 @@ assert.equal(response.status, 200);
 const edition = await response.json();
 console.log(JSON.stringify({
   articles: edition.articles.length,
+  mix: edition.mix,
   fetchedAt: edition.fetchedAt,
   stories: edition.articles.map(({ rank, title, bullets, summaryBasis }) => ({ rank, title, bulletCount: bullets.length, summaryBasis })),
   sources: edition.sources.map(({ name, status, count, error }) => ({ name, status, count, error })),
 }, null, 2));
 assert.ok(edition.articles.length > 0, 'At least one feed must return usable articles');
 assert.ok(edition.articles.length <= 10, 'A briefing must contain at most ten stories');
+assert.equal(edition.mix.technology + edition.mix.news, edition.articles.length);
+assert.deepEqual(edition.mix.target, { technology: 8, news: 2 });
 assert.ok(edition.articles.every(a => a.bullets.length > 0 && a.bullets.length <= 5), 'Every story needs one to five bullets');
 assert.ok(edition.articles.some(a => a.group === 'News'), 'General news must be available');
 assert.ok(edition.articles.some(a => a.group === 'Technology'), 'Technology news must be available');

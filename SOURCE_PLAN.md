@@ -2,7 +2,7 @@
 
 ## The reading experience
 
-The home page is a ranked briefing of at most **10 stories**, with **one to five factual bullets per story**, expanded inline. Original links are optional references. There is no full feed, load-more button, or requirement to open individual article dialogs. If fewer than ten distinct recent stories are available, the app shows fewer rather than filling the list with old or repeated reporting.
+The home page is a ranked briefing of at most **10 stories**, with **one to five factual bullets per story**, expanded inline. The default mix is **8 technology / 2 general news**, with a **7/3** option. Within the technology allocation, up to two slots are reserved for new products or emerging technology when candidates are available. Original links are optional references. There is no full feed, load-more button, or requirement to open individual article dialogs. If fewer than ten distinct recent stories are available, the app shows fewer rather than filling the list with old or repeated reporting.
 
 ## Connected sources
 
@@ -13,17 +13,18 @@ The home page is a ranked briefing of at most **10 stories**, with **one to five
 | New York Times | Top stories | https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml |
 | BBC Technology | Technology | https://feeds.bbci.co.uk/news/technology/rss.xml |
 | Ars Technica | Technology and science | https://feeds.arstechnica.com/arstechnica/index |
+| Ars Gear & Gadgets | Devices and product launches | https://feeds.arstechnica.com/arstechnica/gadgets |
 | TechCrunch | Technology and startups | https://techcrunch.com/feed/ |
 
 ## Importance and relevance
 
 1. Consider only reporting published within the last four days. Missing dates are excluded from the ranked edition.
-2. Score public/economic impact using documented keyword rules: major political developments, public safety, security, economic policy and broad technology changes receive more weight than deals, reviews and soft-news features.
-3. Add signals for freshness, publisher feed placement and related headlines from independent publishers. BBC News and BBC Technology count as one publisher for coverage/diversity.
-4. Apply the visitor's **News + technology**, **More technology**, or **More world news** preference.
-5. Greedily select up to ten articles, penalizing repeated publishers and suppressing closely matching event headlines. Variations such as “buy out” and “buyouts” are normalized.
+2. Score public/economic impact using documented keyword rules: major political developments, public safety, security, economic policy and broad technology changes receive impact weight. New devices and emerging-technology coverage receive a discovery boost; deals and coupons do not count as discovery. Product defects, recalls and corporate layoffs are industry news, not discoveries.
+3. Add signals for freshness, publisher feed placement and related headlines from independent publishers. BBC News and BBC Technology count as one publisher for coverage/diversity. Ars Technica and Ars Gear & Gadgets also count as one publisher.
+4. Apply the chosen mix: **8 tech / 2 news** by default, or **7 tech / 3 news**. Topic classification can recognize technology in general-news feeds and exclude unrelated health/history reporting from technology counts.
+5. Greedily select up to ten articles within the category allocation, reserving up to two of the tech slots for eligible product launches, useful new tools or emerging technologies. Fill shortages from the available category and expose actual counts. Then order the selected stories by importance/relevance, penalizing repeated publishers and suppressing closely matching event headlines. Variations such as “buy out” and “buyouts” are normalized.
 
-This is an explicit heuristic, not an objective importance score, an editorial guarantee, or a learned profile of the visitor. Related-coverage detection uses normalized headline overlap; it can miss paraphrases or group distinct angles too aggressively. Feed order is used as placement, not assumed to represent a publisher's editorial ranking. Each story includes a short explanation of its ranking signals.
+This is an explicit heuristic, not an objective importance score, an editorial guarantee, or a learned profile of the visitor. Related-coverage detection uses normalized headline overlap; it can miss paraphrases or group distinct angles too aggressively. Feed order is used as placement, not assumed to represent a publisher's editorial ranking. Each story includes a short explanation of its ranking signals. Discovery stories carry a **New & notable** badge. The target is a minimum discovery allocation when available, not a ban on additional genuinely important new-technology stories.
 
 ## Summaries you can read in the app
 
