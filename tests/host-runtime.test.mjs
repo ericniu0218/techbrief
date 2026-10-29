@@ -11,14 +11,15 @@ test('news endpoint works when the host prohibits the Cache API and reuses its i
   });
   const fetchMock = mock.method(globalThis, 'fetch', async url => {
     const source = SOURCES.find(s => s.url === url);
-    return new Response(`<rss><channel><item><title>Report from ${source.id}</title><link>https://example.org/${source.id}</link><description>Publisher summary.</description><pubDate>${new Date().toUTCString()}</pubDate></item></channel></rss>`);
+    return new Response(`<rss><channel><item><title>Report from ${source.id}</title><link>https://example.org/${source.id}</link><description>${source.kind === 'launch' ? 'A workspace service for small teams.' : 'Publisher summary.'}</description><pubDate>${new Date().toUTCString()}</pubDate></item></channel></rss>`);
   });
   try {
     const first = await worker.fetch(new Request('https://techbrief.example/api/news'), {}, {});
     assert.equal(first.status, 200);
     assert.equal(first.headers.get('Cache-Control'), 'private, max-age=60');
     const data = await first.json();
-    assert.equal(data.articles.length, SOURCES.length);
+    assert.equal(data.articles.length, SOURCES.filter(s => s.scope !== 'explore').length);
+    assert.equal(data.explore.articles.length, 1, 'Only the maker listing in this fixture is a discovery');
     assert.ok(data.sources.every(s => s.status === 'live'));
     assert.equal(fetchMock.mock.callCount(), SOURCES.length);
 

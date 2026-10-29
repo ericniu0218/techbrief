@@ -7,6 +7,7 @@ const edition = await response.json();
 console.log(JSON.stringify({
   articles: edition.articles.length,
   mix: edition.mix,
+  explore: edition.explore.articles.map(({ title, exploreCategory, source, evidenceKind, bullets }) => ({ title, category: exploreCategory, source, evidenceKind, bulletCount: bullets.length })),
   fetchedAt: edition.fetchedAt,
   stories: edition.articles.map(({ rank, title, bullets, summaryBasis }) => ({ rank, title, bulletCount: bullets.length, summaryBasis })),
   sources: edition.sources.map(({ name, status, count, error }) => ({ name, status, count, error })),
@@ -19,3 +20,8 @@ assert.ok(edition.articles.every(a => a.bullets.length > 0 && a.bullets.length <
 assert.ok(edition.articles.some(a => a.group === 'News'), 'General news must be available');
 assert.ok(edition.articles.some(a => a.group === 'Technology'), 'Technology news must be available');
 assert.ok(edition.articles.every(a => a.url.startsWith('https://') && a.summary.length <= 300));
+assert.ok(edition.explore.articles.length > 0 && edition.explore.articles.length <= 6, 'One to six separate discovery picks must be available');
+assert.ok(edition.explore.articles.every(a => a.bullets.length > 0 && a.bullets.length <= 5));
+assert.ok(edition.explore.articles.every(a => !edition.articles.some(b => b.url === a.url)), 'Discovery picks must not repeat the daily brief');
+assert.ok(edition.explore.articles.every(a => !('sourceText' in a)), 'Full article bodies must stay on the server');
+assert.ok(edition.explore.articles.filter(a => a.evidenceKind === 'maker').length <= 2);
